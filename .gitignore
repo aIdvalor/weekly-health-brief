@@ -1,0 +1,16 @@
+# Private / local-only (never commit)
+mi-fitness-export/
+mi-fitness-trends/
+**/raw_export/
+**/*privacy*.zip
+**/*.zip
+.env
+.venv/
+.venv-demo/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Editor
+.idea/
+.vscode/

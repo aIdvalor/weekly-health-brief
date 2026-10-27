@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""Generate the SAMPLE weekly health brief (index.html) from synthetic CSVs.
+
+Demo / portfolio only — sample data, not a real person's metrics.
+Not medical advice.
+
+Usage:
+  python3 brief/generate_brief.py
+  python3 brief/generate_brief.py --week-end 2025-04-11
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import html
+import shutil
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BRIEF_DIR = Path(__file__).resolve().parent
+SAMPLE_DIR = ROOT / "sample_data"
+CHARTS_SRC = ROOT / "charts"
+CHARTS_DST = BRIEF_DIR / "charts"
+
+# Fictional demo persona — no real identity
+PERSONA = {
+    "label": "Demo athlete · recreational tennis",
+    "band": "club / league-adjacent (illustrative)",
+}
+DEFAULT_WEEK_END = date(2025, 4, 11)
+BASELINE_DAYS = 28
+
+
+def parse_date(s: str) -> date:
+    return date.fromisoformat(s[:10])
+
+
+def load_daily(path: Path) -> list[dict]:
+    rows = []
+    with path.open(newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            r["_d"] = parse_date(r["date"])
+            rows.append(r)
+    return rows
+
+
+def load_tennis(path: Path) -> list[dict]:
+    rows = []
+    with path.open(newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            r["_d"] = parse_date(r["date"])
+            for k in ("duration_min", "train_load", "calories"):
+                try:
+                    r[k] = float(r.get(k) or 0)
+                except ValueError:
+                    r[k] = 0.0
+            rows.append(r)
+    return rows
+
+
+def in_range(d: date, a: date, b: date) -> bool:
+    return a <= d <= b
+
+
+def avg(vals: list[float]) -> float | None:
+    return sum(vals) / len(vals) if vals else None
+
+
+def pct_change(cur: float | None, base: float | None) -> float | None:
+    if cur is None or base is None or base == 0:
+        return None
+    return (cur - base) / base * 100
+
+
+def trend_label(pct: float | None, approx_band: float = 8.0) -> str:
+    if pct is None:
+        return "—"
+    if abs(pct) < approx_band:
+        return "≈"
+    return "↑" if pct > 0 else "↓"
+
+
+def fmt_pct(pct: float | None) -> str:
+    if pct is None:
+        return ""
+    sign = "+" if pct >= 0 else ""
+    return f"{sign}{pct:.0f}%"
+
+
+def fmt_hours(h: float | None) -> str:
+    if h is None:
+        return "—"
+    return f"{h:.1f}h"
+
+
+def fmt_int(n: float | None) -> str:
+    if n is None:
+        return "—"
+    return f"{n:,.0f}"
+
+
+def copy_charts() -> None:
+    CHARTS_DST.mkdir(parents=True, exist_ok=True)
+    for name in ("steps.png", "sleep.png", "resting_hr.png", "tennis_load.png"):
+        src = CHARTS_SRC / name
+        if src.exists():
+            shutil.copy(src, CHARTS_DST / name)
+
+
+def compute(week_end: date) -> dict:
+    week_start = week_end - timedelta(days=6)
+    base_end = week_start - timedelta(days=1)
+    base_start = base_end - timedelta(days=BASELINE_DAYS - 1)
+
+    daily = load_daily(SAMPLE_DIR / "daily_summary.csv")
+    tennis = load_tennis(SAMPLE_DIR / "workouts_tennis.csv")
+
+    week = [r for r in daily if in_range(r["_d"], week_start, week_end)]
+    baseline = [r for r in daily if in_range(r["_d"], base_start, base_end)]
+
+    def sleep_h(rows):
+        vals = []
+        for r in rows:
+            v = r.get("sleep_total_min") or ""
+            if v == "":
+                continue
+            vals.append(float(v) / 60.0)
+        return avg(vals)
+
+    def steps_avg(rows):
+        vals = [float(r["steps"]) for r in rows if (r.get("steps") or "") != ""]
+        return avg(vals)
+
+    def rhr_avg(rows):
+        vals = []
+        for r in rows:
+            v = r.get("avg_rhr") or ""
+            if v == "":
+                continue
+            f = float(v)
+            if f <= 0:
+                continue
+            vals.append(f)
+        return avg(vals)
+
+    w_sleep, b_sleep = sleep_h(week), sleep_h(baseline)
+    w_steps, b_steps = steps_avg(week), steps_avg(baseline)
+    w_rhr, b_rhr = rhr_avg(week), rhr_avg(baseline)
+
+    w_ten = [t for t in tennis if in_range(t["_d"], week_start, week_end)]
+    b_ten = [t for t in tennis if in_range(t["_d"], base_start, base_end)]
+    n_weeks_base = BASELINE_DAYS / 7.0
+
+    w_sess = len(w_ten)
+    w_hours = sum(t["duration_min"] for t in w_ten) / 60.0
+    w_load = sum(t["train_load"] for t in w_ten)
+    b_sess = len(b_ten) / n_weeks_base
+    b_hours = sum(t["duration_min"] for t in b_ten) / 60.0 / n_weeks_base
+    b_load = sum(t["train_load"] for t in b_ten) / n_weeks_base
+
+    short_nights = []
+    for r in week:
+        v = r.get("sleep_total_min") or ""
+        if v == "":
+            continue
+        h = float(v) / 60.0
+        if h < 6.5:
+            short_nights.append((r["date"], h))
+
+    sleep_pct = pct_change(w_sleep, b_sleep)
+    steps_pct = pct_change(w_steps, b_steps)
+    rhr_pct = pct_change(w_rhr, b_rhr)
+    load_pct = pct_change(w_load, b_load)
+
+    return {
+        "week_start": week_start,
+        "week_end": week_end,
+        "base_start": base_start,
+        "base_end": base_end,
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "sleep": w_sleep,
+        "sleep_base": b_sleep,
+        "sleep_pct": sleep_pct,
+        "sleep_trend": trend_label(sleep_pct, 8),
+        "steps": w_steps,
+        "steps_base": b_steps,
+        "steps_pct": steps_pct,
+        "steps_trend": trend_label(steps_pct, 10),
+        "rhr": w_rhr,
+        "rhr_base": b_rhr,
+        "rhr_pct": rhr_pct,
+        "rhr_trend": trend_label(rhr_pct, 5),
+        "tennis_sess": w_sess,
+        "tennis_hours": w_hours,
+        "tennis_load": w_load,
+        "tennis_sess_base": b_sess,
+        "tennis_hours_base": b_hours,
+        "tennis_load_base": b_load,
+        "load_pct": load_pct,
+        "load_trend": trend_label(load_pct, 10),
+        "short_nights": short_nights,
+        "week_days": week,
+        "week_tennis": w_ten,
+    }
+
+
+def build_story(m: dict) -> str:
+    short = m["short_nights"]
+    if short:
+        d0, h0 = short[0]
+        short_bit = (
+            f'… except <strong>{html.escape(d0)}</strong> (~{h0:.1f}h), which is the classic '
+            "“one short night that makes the next day feel like Windows Update.”"
+        )
+    else:
+        short_bit = " No dramatic short nights this stretch — boring in the best way."
+
+    load_pct = m["load_pct"] or 0
+    return f"""
+    <p>If last week were a restaurant order, our demo athlete didn’t get the light salad —
+    they got the tasting menu and asked for extra bread. Sleep averaged a healthy
+    <strong>{fmt_hours(m['sleep'])}</strong>, like keeping the phone on overnight charge instead
+    of living at 12% battery{short_bit}</p>
+    <p>Steps ran warm (<strong>~{fmt_int(m['steps'])}/day</strong>). For perspective: many step
+    challenges treat <strong>10k</strong> as the vanity badge; WHO cares more that adults clear
+    ~150–300 min/week of moderate activity (or 75–150 vigorous). Tennis alone was
+    ~<strong>{m['tennis_hours']:.1f} hours</strong> on court across
+    <strong>{m['tennis_sess']}</strong> sessions — denser than a typical recreational template of
+    2–3 sessions / ~2–3 hours a week. At a {html.escape(PERSONA['band'])} level, volume actually
+    taxes legs and focus, not just vibes.</p>
+    <p>Resting HR stuck around <strong>~{m['rhr']:.0f}</strong>. Untrained adults often cruise the
+    60s–70s; regular tennis players in research often land lower. The useful self-awareness bit:
+    RHR stayed roughly flat <em>while</em> load moved ~{abs(load_pct):.0f}% vs the prior month.
+    That <em>may</em> mean the week was absorbed okay; it does <strong>not</strong> mean cloning
+    the week forever is free.</p>
+    """
+
+
+def build_hints(m: dict) -> str:
+    load_pct = m["load_pct"] or 0
+    items = [
+        "Flat-ish RHR + a busier tennis week <em>may</em> suggest fitness is carrying the load — still watch how legs, mood, and sleep feel 24–48h after stacked days.",
+        (
+            "One short night mid-week <em>may</em> be noise (late match, travel, “one more YouTube”) rather than a new pattern — unless it starts chaining."
+            if m["short_nights"]
+            else "Sleep stayed in band without a clear short-night spike — keep protecting post-match nights anyway."
+        ),
+        "A step bump <em>may</em> be mostly court footsteps wearing a pedometer costume, not proof more cardio homework is required.",
+    ]
+    if abs(load_pct) >= 15:
+        items.append(
+            f"A ~{load_pct:.0f}% load swing vs the prior month is coach-speak for “fun week — don’t photocopy it twice.” Recovery isn’t laziness; it’s how recreational players keep hitting clean balls in week three."
+        )
+    return "<ul>" + "".join(f"<li>{i}</li>" for i in items) + "</ul>"
+
+
+def build_wellness() -> str:
+    return """
+    <ul>
+      <li><strong>Sleep:</strong> National Sleep Foundation–style guidance for adults stays ~7–9h.
+        Protect the night after a stacked match day like it’s a meeting with your future self.</li>
+      <li><strong>Activity:</strong> WHO 2020 — move most days; add muscle work 2+ days/week.
+        Many tennis humans are cardiorespiratory-rich; the missing subplot is often legs/hips
+        strength + a true easy day.</li>
+      <li><strong>Load:</strong> sports-science folk often treat sudden week-to-week spikes as the
+        “blister and cranky shoulder” zone. A dense block isn’t catastrophic, but cloning it twice
+        in a row is how “I’m fine” becomes “why does my elbow have opinions.”</li>
+      <li><strong>Tennis lens:</strong> at club / recreational–intermediate level, quality &amp;
+        recovery beat grinding hours for ego. One focused session often beats a fourth exhausted
+        one where every forehand is a negotiation.</li>
+    </ul>
+    """
+
+
+def tile(label: str, value: str, sub: str, trend: str) -> str:
+    trend_class = {"↑": "up", "↓": "down", "≈": "flat"}.get(trend, "flat")
+    return f"""
+    <article class="tile">
+      <div class="tile-label">{html.escape(label)}</div>
+      <div class="tile-value">{value}</div>
+      <div class="tile-sub">{sub}</div>
+      <div class="trend {trend_class}">{html.escape(trend)}</div>
+    </article>
+    """
+
+
+def render(m: dict) -> str:
+    ws, we = m["week_start"], m["week_end"]
+    week_label = f"{ws.strftime('%b %-d')}–{we.strftime('%b %-d, %Y')}"
+
+    sleep_sub = f"vs sample ~4 weeks {fmt_hours(m['sleep_base'])} ({fmt_pct(m['sleep_pct'])})"
+    steps_sub = f"vs ~{fmt_int(m['steps_base'])}/day ({fmt_pct(m['steps_pct'])}) · goal 8k"
+    rhr_sub = f"vs ~{m['rhr_base']:.0f} ({fmt_pct(m['rhr_pct'])}) · sedentary often 60–80"
+    ten_sub = (
+        f"{m['tennis_sess']} sessions · ~{m['tennis_hours']:.1f}h · "
+        f"load {fmt_pct(m['load_pct'])} vs typical sample week"
+    )
+
+    tiles = "".join(
+        [
+            tile("Sleep", fmt_hours(m["sleep"]) + " avg", sleep_sub, m["sleep_trend"]),
+            tile("Steps", f"~{fmt_int(m['steps'])}/day", steps_sub, m["steps_trend"]),
+            tile("Resting HR", f"~{m['rhr']:.0f} bpm", rhr_sub, m["rhr_trend"]),
+            tile("Tennis", f"load {fmt_int(m['tennis_load'])}", ten_sub, m["load_trend"]),
+        ]
+    )
+
+    day_rows = []
+    for r in m["week_days"]:
+        sm = r.get("sleep_total_min") or ""
+        sleep_h = f"{float(sm)/60:.1f}h" if sm else "—"
+        rhr = r.get("avg_rhr") or "—"
+        steps = r.get("steps") or "—"
+        day_rows.append(
+            f"<tr><td>{html.escape(r['date'])}</td><td>{sleep_h}</td>"
+            f"<td>{html.escape(str(steps))}</td><td>{html.escape(str(rhr))}</td></tr>"
+        )
+    day_table = "\n".join(day_rows)
+
+    ten_rows = []
+    for t in m["week_tennis"]:
+        ten_rows.append(
+            f"<tr><td>{html.escape(t['date'])}</td>"
+            f"<td>{t['duration_min']:.0f} min</td>"
+            f"<td>{t['train_load']:.0f}</td></tr>"
+        )
+    ten_table = (
+        "\n".join(ten_rows) if ten_rows else "<tr><td colspan='3'>No tennis this week</td></tr>"
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Weekly Health Brief · SAMPLE · {html.escape(week_label)}</title>
+<style>
+  :root {{
+    --bg: #0f1419;
+    --surface: #1a222c;
+    --surface2: #232d3a;
+    --text: #e8eef4;
+    --muted: #9aabbc;
+    --accent: #5eb1ff;
+    --accent2: #7ddea2;
+    --warn: #f0b429;
+    --up: #7ddea2;
+    --down: #ff8a7a;
+    --flat: #9aabbc;
+    --border: #2e3a4a;
+    --radius: 14px;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }}
+  .wrap {{
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 1.5rem 1.15rem 3.5rem;
+  }}
+  header.hero {{ margin-bottom: 1.5rem; }}
+  header.hero .eyebrow {{
+    color: var(--accent);
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }}
+  header.hero h1 {{
+    margin: 0.35rem 0 0.4rem;
+    font-size: clamp(1.55rem, 4vw, 1.95rem);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }}
+  header.hero .meta {{
+    color: var(--muted);
+    font-size: 0.92rem;
+  }}
+  header.hero .meta strong {{ color: var(--text); font-weight: 600; }}
+  .badge {{
+    display: inline-block;
+    margin: 0.55rem 0 0;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    background: #3a2e12;
+    color: var(--warn);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }}
+  .disclaimer {{
+    margin: 1rem 0 0;
+    padding: 0.7rem 0.9rem;
+    background: var(--surface2);
+    border-left: 3px solid var(--warn);
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }}
+  section {{ margin: 1.75rem 0; }}
+  section h2 {{
+    margin: 0 0 0.75rem;
+    font-size: 1.05rem;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }}
+  .tiles {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }}
+  @media (min-width: 560px) {{
+    .tiles {{ grid-template-columns: repeat(4, 1fr); }}
+  }}
+  .tile {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.9rem 0.85rem 0.75rem;
+    position: relative;
+    min-height: 7.2rem;
+  }}
+  .tile-label {{
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    font-weight: 600;
+  }}
+  .tile-value {{
+    margin-top: 0.35rem;
+    font-size: 1.35rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }}
+  .tile-sub {{
+    margin-top: 0.35rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+    line-height: 1.35;
+  }}
+  .trend {{
+    position: absolute;
+    top: 0.75rem;
+    right: 0.85rem;
+    font-size: 1.1rem;
+    font-weight: 700;
+  }}
+  .trend.up {{ color: var(--up); }}
+  .trend.down {{ color: var(--down); }}
+  .trend.flat {{ color: var(--flat); }}
+  .story p, .hints, .wellness {{ color: var(--text); font-size: 0.98rem; }}
+  .story p {{ margin: 0 0 0.9rem; }}
+  .hints ul, .wellness ul {{ margin: 0; padding-left: 1.15rem; }}
+  .hints li, .wellness li {{ margin-bottom: 0.55rem; }}
+  details.look {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.2rem 0.9rem 0.9rem;
+  }}
+  details.look > summary {{
+    cursor: pointer;
+    list-style: none;
+    padding: 0.85rem 0.15rem;
+    font-weight: 650;
+    font-size: 1.05rem;
+  }}
+  details.look > summary::-webkit-details-marker {{ display: none; }}
+  details.look > summary::before {{ content: "▸ "; color: var(--accent); }}
+  details.look[open] > summary::before {{ content: "▾ "; }}
+  .look-note {{
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: 0 0 1rem;
+  }}
+  .charts {{ display: grid; gap: 1rem; }}
+  .charts figure {{
+    margin: 0;
+    background: var(--surface2);
+    border-radius: 10px;
+    padding: 0.6rem;
+  }}
+  .charts img {{
+    width: 100%;
+    height: auto;
+    display: block;
+    border-radius: 6px;
+  }}
+  .charts figcaption {{
+    margin-top: 0.4rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+    text-align: center;
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    margin: 0.75rem 0 1.1rem;
+  }}
+  th, td {{
+    text-align: left;
+    padding: 0.45rem 0.4rem;
+    border-bottom: 1px solid var(--border);
+  }}
+  th {{
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }}
+  .update {{
+    background: linear-gradient(145deg, #1a2838, var(--surface));
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.05rem;
+  }}
+  .update ol {{
+    margin: 0.5rem 0 0;
+    padding-left: 1.2rem;
+    color: var(--muted);
+    font-size: 0.92rem;
+  }}
+  .update code {{
+    background: var(--surface2);
+    padding: 0.1rem 0.35rem;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }}
+  footer {{
+    margin-top: 2rem;
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-align: center;
+  }}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Weekly Health Brief</div>
+      <h1>Week of {html.escape(week_label)}</h1>
+      <div class="meta">
+        <strong>{html.escape(PERSONA['label'])}</strong>
+        · generated {html.escape(m['generated'])}
+      </div>
+      <div class="badge">Sample / demo data</div>
+      <p class="disclaimer">
+        Coach-light summary for self-awareness — <strong>not medical advice</strong>.
+        All numbers on this page are <strong>synthetic SAMPLE data</strong> for a portfolio demo.
+        Wearables guess; real bodies know. If something feels off in real life, talk to a clinician.
+      </p>
+    </header>
+
+    <section>
+      <h2>At a glance</h2>
+      <div class="tiles">
+        {tiles}
+      </div>
+    </section>
+
+    <section class="story">
+      <h2>The story</h2>
+      {build_story(m)}
+    </section>
+
+    <section class="hints">
+      <h2>What this may hint</h2>
+      {build_hints(m)}
+    </section>
+
+    <section class="wellness">
+      <h2>General wellness notes</h2>
+      <p style="color:var(--muted);font-size:0.9rem;margin:0 0 0.6rem">
+        Guidelines for a recreational adult tennis player — not a diagnosis, not a training plan,
+        and not tied to any real person.
+      </p>
+      {build_wellness()}
+    </section>
+
+    <section>
+      <details class="look">
+        <summary>Look closer</summary>
+        <p class="look-note">
+          Charts + daily numbers from <strong>sample_data/</strong>. Stress, SpO₂, and weight stay
+          out of the default story. Open only if you want the plumbing.
+        </p>
+        <div class="charts">
+          <figure>
+            <img src="charts/sleep.png" alt="SAMPLE sleep trend chart"/>
+            <figcaption>SAMPLE · Sleep (hours)</figcaption>
+          </figure>
+          <figure>
+            <img src="charts/steps.png" alt="SAMPLE steps trend chart"/>
+            <figcaption>SAMPLE · Steps</figcaption>
+          </figure>
+          <figure>
+            <img src="charts/resting_hr.png" alt="SAMPLE resting heart rate chart"/>
+            <figcaption>SAMPLE · Resting HR</figcaption>
+          </figure>
+          <figure>
+            <img src="charts/tennis_load.png" alt="SAMPLE tennis training load chart"/>
+            <figcaption>SAMPLE · Tennis load</figcaption>
+          </figure>
+        </div>
+
+        <h3 style="font-size:0.95rem;margin:1.25rem 0 0.4rem">This week — daily (sample)</h3>
+        <table>
+          <thead><tr><th>Date</th><th>Sleep</th><th>Steps</th><th>RHR</th></tr></thead>
+          <tbody>
+            {day_table}
+          </tbody>
+        </table>
+
+        <h3 style="font-size:0.95rem;margin:0.5rem 0 0.4rem">This week — tennis (sample)</h3>
+        <table>
+          <thead><tr><th>Date</th><th>Duration</th><th>Load</th></tr></thead>
+          <tbody>
+            {ten_table}
+          </tbody>
+        </table>
+        <p class="look-note">CSVs: <code>../sample_data/daily_summary.csv</code>, <code>../sample_data/workouts_tennis.csv</code>.</p>
+      </details>
+    </section>
+
+    <section class="update">
+      <h2 style="margin-top:0">Update path (demo)</h2>
+      <p style="margin:0;color:var(--muted);font-size:0.92rem">
+        In a real workflow you’d re-export from a wearable privacy download, clean to daily CSVs,
+        then regenerate the brief. This repo ships <strong>sample data only</strong> — swap the CSVs
+        to try your own (keep personal exports out of public remotes).
+      </p>
+      <ol>
+        <li>Edit or replace files under <code>sample_data/</code> (same column names).</li>
+        <li>Optional: regenerate charts with your own plotting script.</li>
+        <li>Run <code>python3 brief/generate_brief.py</code> (optional <code>--week-end YYYY-MM-DD</code>).</li>
+        <li>Open <code>brief/index.html</code> in a browser.</li>
+      </ol>
+    </section>
+
+    <footer>
+      Public portfolio demo · SAMPLE data only · not medical advice · UX first, plumbing on demand
+    </footer>
+  </div>
+</body>
+</html>
+"""
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Generate SAMPLE weekly health brief HTML")
+    ap.add_argument(
+        "--week-end",
+        type=str,
+        default=str(DEFAULT_WEEK_END),
+        help="Last day of the featured week (YYYY-MM-DD).",
+    )
+    args = ap.parse_args()
+    week_end = parse_date(args.week_end)
+
+    copy_charts()
+    metrics = compute(week_end)
+    out = BRIEF_DIR / "index.html"
+    out.write_text(render(metrics), encoding="utf-8")
+    print(f"Wrote {out}")
+    print(
+        f"SAMPLE week {metrics['week_start']} → {metrics['week_end']} | "
+        f"sleep {fmt_hours(metrics['sleep'])} {metrics['sleep_trend']} | "
+        f"steps ~{fmt_int(metrics['steps'])} {metrics['steps_trend']} | "
+        f"RHR ~{metrics['rhr']:.0f} {metrics['rhr_trend']} | "
+        f"tennis load {fmt_int(metrics['tennis_load'])} {metrics['load_trend']} ({fmt_pct(metrics['load_pct'])})"
+    )
+
+
+if __name__ == "__main__":
+    main()
